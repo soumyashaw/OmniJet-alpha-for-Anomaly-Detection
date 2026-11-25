@@ -1,51 +1,13 @@
 """ Python file to train the OmniJet-alpha model with continuous tokens - Aachen anomaly detection variant.
 
-PROJECT STRUCTURE:
-AnomalyDetection/
-├── src/
-│   ├── train/              # Training scripts (e.g., train.py, train_custom_aachen.py)
-│   ├── eval/               # Evaluation scripts (evaluate.py, evaluate_true_roc.py, etc.)
-│   ├── data/               # Data processing (split_h5_dataset.py)
-│   ├── viz/                # Visualization (unsupervised_learning.py, visualize_clustering.py)
-│   └── poc_expts/          # Proof-of-concept experiments (this directory)
-├── scripts/                # Job launchers (.sh and .sub files)
-├── gabbro/                 # Core library (models, data utilities, metrics)
-└── [output directories: plots/, results/, logs/, checkpoints/, dijet_expts/, aachen_head_expts/]
-
-COMPONENTS USED:
-├── Data Loading
-│   ├── load_multiple_h5_files
-│   ├── ak_select_and_preprocess
-│   ├── ak_pad
-│   └── JetDataset
-│
-├── Model Architecture
-│   ├── BackboneAachenClassificationLightning
-│   │   ├── BackboneTransformer (use_continuous_input=True)
-│   │   └── AachenClassificationHead (class_head_type="aachen")
-│   │
-│   └── Loss: CrossEntropyLoss
-│
-└── Training
-    ├── PyTorch Lightning Trainer
-    ├── AdamW + ConstantLR Scheduler
-    ├── AUC & ARGOS metric callbacks
-    └── Weights & Biases logging (optional)
-
 USAGE:
 Run from project root with:
-  python -m src.poc_expts.train_custom_aachen [args]
+  python -m src.train.train_custom_aachen [args] --use_mlflow
 
 Or via shell launcher:
   ./scripts/train_aachen.sh
-
-DESCRIPTION:
-Trains a custom anomaly detection model on LHCO datasets using weak supervision.
-- Training: 200k clean background + 100k polluted background + 2k-25k signal jets
-- Testing: 200k clean background + 50k signal jets
-- Merge strategies: concat, average, weighted_sum, attention
-- Aachen head: Two-jet model for anomaly detection
 """
+
 # imports
 import os
 import json
@@ -60,11 +22,10 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, TensorDataset
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, Callback
 from sklearn.metrics import roc_auc_score, roc_curve
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.loggers import MLFlowLogger
 from dotenv import load_dotenv
 from datetime import datetime
 from pathlib import Path
-import wandb
 
 # gabbro imports
 from gabbro.utils.arrays import ak_pad
@@ -73,8 +34,7 @@ from gabbro.models.backbone import BackboneClassificationLightning, BackboneDije
 from gabbro.models.backbone_base import BackboneTransformer
 from gabbro.data.loading import load_lhco_jets_from_h5, load_multiple_h5_files
 
-load_dotenv()  # Load environment variables from .env file (for W&B API key, etc.)
-
+load_dotenv()  # Load environment variables from .env file
 
 def _to_plain_dict(obj):
     """Convert config-like containers (e.g., DictConfig) to plain dict recursively."""
@@ -235,6 +195,31 @@ class ExperimentLogger:
     def get_checkpoint_dir(self):
         """Get checkpoint directory for this run."""
         return str(self.run_dir / "checkpoints")
+
+
+class MLflowArtifactsCallback(Callback):
+    """Record the full run configuration and the best checkpoint for each monitor."""
+
+    def __init__(self, full_config, config_path):
+        self.full_config = full_config
+        self.config_path = config_path
+
+    def on_fit_start(self, trainer, pl_module):
+        if trainer.is_global_zero:
+            mlflow_logger = trainer.logger
+            mlflow_logger.log_hyperparams(self.full_config)
+            mlflow_logger.experiment.log_artifact(mlflow_logger.run_id, str(self.config_path))
+
+    def on_fit_end(self, trainer, pl_module):
+        if trainer.is_global_zero:
+            mlflow_logger = trainer.logger
+            for checkpoint in trainer.checkpoint_callbacks:
+                if checkpoint.best_model_path:
+                    mlflow_logger.experiment.log_artifact(
+                        mlflow_logger.run_id,
+                        checkpoint.best_model_path,
+                        artifact_path=f"checkpoints/{checkpoint.monitor}",
+                    )
 
 
 def create_model_config(pp_dict, args):
@@ -654,7 +639,6 @@ def set_backbone_requires_grad(model, requires_grad=True):
     return num_params
 
 
-
 def main():
     parser = argparse.ArgumentParser(description="OmniJet-alpha Anomaly Detection Training Script")
     parser.add_argument("--dataset_path", default=str(os.getenv("DATASET_PATH")), type=str, help="Path to the LHCO dataset")
@@ -662,7 +646,6 @@ def main():
     parser.add_argument("--jet_name", type=str, default=str(os.getenv("JET_NAME")), choices=["jet1", "jet2", "both"], help="Name of the jet to use from the dataset")
     parser.add_argument("--merge_strategy", type=str, default=str(os.getenv("MERGE_STRATEGY")), choices=["concat", "average", "weighted_sum", "attention"], help="Merge strategy for dijet model")
     parser.add_argument("--batch_size", type=int, default=int(os.getenv("BATCH_SIZE")), help="Batch size for training")
-    # parser.add_argument("--max_steps", type=int, default=int(os.getenv("MAX_STEPS")), help="Maximum number of training steps")
     parser.add_argument("--max_epochs", type=int, default=int(os.getenv("MAX_EPOCHS")), help="Maximum number of training epochs")
     parser.add_argument("--learning_rate", type=float, default=float(os.getenv("LEARNING_RATE")), help="Learning rate")
     parser.add_argument("--train_val_split", type=float, default=float(os.getenv("TRAIN_VAL_SPLIT")), help="Train/validation split ratio")
@@ -676,15 +659,11 @@ def main():
     parser.add_argument("--freeze_backbone", action="store_true", help="Freeze backbone weights during training (no gradient updates)")
     parser.add_argument("--update_backbone", action="store_true", default=True, help="Update backbone weights during training (default: True, set to False with --freeze_backbone)")
 
-    # W&B arguments
-    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb_project", type=str, default="anomaly-detection-lhco", help="W&B project name")
-    parser.add_argument("--wandb_entity", type=str, default=None, help="W&B entity/team name (optional)")
-    parser.add_argument("--wandb_run_name", type=str, default=None, help="W&B run name (optional, auto-generated if not provided)")
-    
-    # HPC arguments
-    parser.add_argument("--use_hpc", action="store_true", help="Disable progress bar for HPC environments to avoid large log files")
-    
+    parser.add_argument("--use_mlflow", action="store_true", help="Enable MLflow logging")
+    parser.add_argument("--mlflow_experiment", default=os.getenv("MLFLOW_EXPERIMENT_NAME"), help="MLflow experiment name")
+    parser.add_argument("--mlflow_run_name", help="MLflow run name (defaults to the local run name)")
+    parser.add_argument("--mlflow_tracking_uri", default=os.getenv("MLFLOW_TRACKING_URI"), help="MLflow tracking URI (defaults to a SQLite database in the log directory)")
+        
     args = parser.parse_args()
 
     # ============================================================
@@ -1024,32 +1003,27 @@ def main():
     # ARGOS callback: computes ARGOS metric on validation set each epoch and logs it
     argos_callback = ARGOSCallback()
 
-    # Setup W&B logger
-    loggers = []
-    if args.use_wandb:
-        wandb_run_name = args.wandb_run_name if args.wandb_run_name else exp_logger.run_name
-        
-        wandb_logger = WandbLogger(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=wandb_run_name,
-            save_dir=str(exp_logger.run_dir),
-            config=full_config,
-            log_model=True,
+    callbacks = [checkpoint_loss_callback, checkpoint_argos_callback, auc_callback, argos_callback, early_stop_callback]
+    mlflow_logger = None
+    if args.use_mlflow:
+        tracking_uri = args.mlflow_tracking_uri
+        artifact_location = None
+        if not tracking_uri:
+            log_dir = exp_logger.log_dir.resolve()
+            tracking_uri = f"sqlite:///{log_dir / 'mlflow.db'}"
+            artifact_location = (log_dir / "mlflow-artifacts").as_uri()
+
+        run_name = args.mlflow_run_name or exp_logger.run_name
+        mlflow_logger = MLFlowLogger(
+            experiment_name=args.mlflow_experiment,
+            run_name=run_name,
+            tracking_uri=tracking_uri,
+            artifact_location=artifact_location,
         )
-        loggers.append(wandb_logger)
-        
-        print(f"\n{'=' * 80}")
-        print(f"W&B logging enabled!")
-        print(f"  Project: {args.wandb_project}")
-        if args.wandb_entity:
-            print(f"  Entity: {args.wandb_entity}")
-        print(f"  Run name: {wandb_run_name}")
-        print(f"  Run URL: {wandb_logger.experiment.url}")
-        print(f"{'=' * 80}\n")
+        callbacks.append(MLflowArtifactsCallback(full_config, exp_logger.run_dir / "config.json"))
+        print(f"\nMLflow logging enabled for {args.mlflow_experiment} / {run_name}\n")
     else:
-        print(f"\nW&B logging disabled. Use --use_wandb to enable.\n")
-        wandb_logger = None
+        print("\nMLflow logging disabled. Use --use_mlflow to enable.\n")
 
     # Create trainer
     print("Starting training...")
@@ -1060,8 +1034,8 @@ def main():
         max_epochs=args.max_epochs,
         accelerator="gpu",
         devices=1,
-        logger=loggers if loggers else False,
-        callbacks=[checkpoint_loss_callback, checkpoint_argos_callback, auc_callback, argos_callback, early_stop_callback],
+        logger=mlflow_logger if mlflow_logger is not None else False,
+        callbacks=callbacks,
         log_every_n_steps=20,
         gradient_clip_val=1,
         precision="32",
@@ -1087,9 +1061,8 @@ def main():
         print(f"Best checkpoint: {checkpoint_argos_callback.best_model_path}")
         print(f"Best validation ARGOS: {checkpoint_argos_callback.best_model_score:.4f}")
         print(f"Results saved to: {exp_logger.run_dir}")
-        if args.use_wandb:
-            print(f"W&B run: {wandb.run.url}")
-            wandb.finish()
+        if mlflow_logger is not None:
+            print(f"MLflow run ID: {mlflow_logger.run_id}")
         print("=" * 80 + "\n")
         
     except KeyboardInterrupt:
@@ -1097,10 +1070,7 @@ def main():
         print("Training interrupted by user!")
         print(f"Partial results saved to: {exp_logger.run_dir}")
         print("=" * 80 + "\n")
-        
-        if args.use_wandb:
-            wandb.finish()
-        
+
     except Exception as e:
         # Log error if training fails
         error_info = {
@@ -1114,10 +1084,7 @@ def main():
         print(f"Training failed! Error logged to: {exp_logger.run_dir}")
         print(f"Error: {e}")
         print("=" * 80 + "\n")
-        
-        if args.use_wandb:
-            wandb.finish(exit_code=1)
-        
+
         raise
 
 if __name__ == "__main__":

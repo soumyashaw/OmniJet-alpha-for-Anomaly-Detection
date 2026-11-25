@@ -1,0 +1,24 @@
+# Request resources
+request_gpus   = 1
+request_cpus   = 1
+request_memory = 16GB
+
+# Copy only this credential from the submit shell into each queued job.
+getenv = WANDB_API_KEY
+
+# Files and arguments
+executable = scripts/train_aachen.sh
+arguments  = $(dataset_path) $(seed) $(jet_name) $(merge_strategy) $(batch_size) $(max_epochs) $(learning_rate) $(train_val_split) $(n_signal) $(n_supp_background) $(n_background) $(embedding_dim) $(config_name) $(log_dir) $(pretrained_ckpt) $(load_pretrained) $(freeze_backbone) $(use_class_weights) $(wandb_project) $(use_wandb) $(use_hpc)
+
+output = batchSubmissions/train_aachen_$(Cluster)_$(Process)_$(config_name).out
+error  = batchSubmissions/train_aachen_$(Cluster)_$(Process)_$(config_name).err
+log    = batchSubmissions/train_aachen_$(Cluster).log
+
+# CSV columns, in order:
+# config_name, dataset_path, seed, jet_name, merge_strategy,
+# batch_size, max_epochs, learning_rate, train_val_split, n_signal,
+# n_supp_background, n_background, embedding_dim, log_dir, pretrained_ckpt,
+# load_pretrained, freeze_backbone, use_class_weights, wandb_project,
+# use_wandb, use_hpc
+# Skip the header ([1:]); every remaining CSV row becomes one queued job.
+queue config_name,dataset_path,seed,jet_name,merge_strategy,batch_size,max_epochs,learning_rate,train_val_split,n_signal,n_supp_background,n_background,embedding_dim,log_dir,pretrained_ckpt,load_pretrained,freeze_backbone,use_class_weights,wandb_project,use_wandb,use_hpc from [1:] scripts/aachen_configs.csv

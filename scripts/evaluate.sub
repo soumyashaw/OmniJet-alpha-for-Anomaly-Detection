@@ -1,0 +1,13 @@
+# Request resources
+request_gpus   = 1
+request_cpus   = 8
+request_memory = 90GB
+
+# Files
+executable = scripts/evaluate.sh
+output     = batchSubmissions/evaluate_$(Cluster)_$(Process)_$(UnixTime).out
+error      = batchSubmissions/evaluate_$(Cluster)_$(Process)_$(UnixTime).err
+log        = batchSubmissions/evaluate_$(Cluster)_$(UnixTime).log
+
+# Queue job
+queue
